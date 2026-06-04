@@ -1,0 +1,22 @@
+# Product data (large generated/scraped assets)
+pulse rx/Products/
+
+# Source item list
+pulse rx/Item List - 260327 (Items with ID).csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Scraper local config
+pulse rx/scraper/config.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
