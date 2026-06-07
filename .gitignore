@@ -26,3 +26,7 @@ PulseRxScraper.new.exe
 Thumbs.db
 .idea/
 .vscode/
+
+# Stray screenshots / scratch images at repo root
+/image.png
+/*.png
