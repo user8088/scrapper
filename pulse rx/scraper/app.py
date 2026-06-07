@@ -125,6 +125,7 @@ class ScraperApp(tk.Tk):
         self.var_offset = tk.IntVar(value=0)
         self.var_minscore = tk.DoubleVar(value=80.0)
         self.var_delay = tk.DoubleVar(value=0.8)
+        self.var_threads = tk.IntVar(value=4)
         self.var_header = tk.StringVar(value="Details")
         self.var_order = tk.StringVar(value="dwatson, healthwire")
         self.var_skip = tk.BooleanVar(value=False)
@@ -133,6 +134,7 @@ class ScraperApp(tk.Tk):
         self._spin(opts, "Start offset:", self.var_offset, 0, 100000, 1)
         self._spin(opts, "Min match score:", self.var_minscore, 0, 100, 2, inc=1.0, width=5)
         self._spin(opts, "Delay (s):", self.var_delay, 0, 30, 3, inc=0.1, width=5)
+        self._spin(opts, "Threads:", self.var_threads, 1, 16, 4, width=5)
 
         opts2 = ttk.Frame(f)
         opts2.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -265,6 +267,7 @@ class ScraperApp(tk.Tk):
             min_score=float(self.var_minscore.get()),
             request_delay=float(self.var_delay.get()),
             skip_filled=bool(self.var_skip.get()),
+            max_workers=int(self.var_threads.get()),
         )
 
     def _save_config(self):
@@ -272,6 +275,7 @@ class ScraperApp(tk.Tk):
             "root": self.var_root.get(), "csv": self.var_csv.get(),
             "batch": int(self.var_batch.get()), "offset": int(self.var_offset.get()),
             "minscore": float(self.var_minscore.get()), "delay": float(self.var_delay.get()),
+            "threads": int(self.var_threads.get()),
             "header": self.var_header.get(), "order": self.var_order.get(),
             "skip": bool(self.var_skip.get()), "mode": self.var_mode.get(),
         }
@@ -294,6 +298,7 @@ class ScraperApp(tk.Tk):
             self.var_offset.set(d.get("offset", 0))
             self.var_minscore.set(d.get("minscore", 80.0))
             self.var_delay.set(d.get("delay", 0.8))
+            self.var_threads.set(d.get("threads", 4))
             self.var_header.set(d.get("header", "Details"))
             self.var_order.set(d.get("order", "dwatson, healthwire"))
             self.var_skip.set(d.get("skip", False))
@@ -334,7 +339,7 @@ class ScraperApp(tk.Tk):
         self.btn_commit.configure(state="disabled")
         direct = self.var_mode.get() == "direct"
         self._logline(f"Running {len(folders)} products (offset {offset}) | order={cfg.source_order} "
-                      f"| mode={'DIRECT WRITE' if direct else 'preview'}")
+                      f"| threads={cfg.max_workers} | mode={'DIRECT WRITE' if direct else 'preview'}")
 
         self.worker = threading.Thread(target=self._worker, args=(folders, cfg, direct), daemon=True)
         self.worker.start()

@@ -23,7 +23,9 @@ import os
 import re
 import time
 import json
+import random
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
@@ -259,10 +261,11 @@ class ScrapeConfig:
     batch_size: int = 50
     source_order: tuple = (SOURCE_DWATSON, SOURCE_HEALTHWIRE)
     min_score: float = 80.0               # dwatson strict match threshold
-    request_delay: float = 0.8            # polite delay between products (s)
+    request_delay: float = 0.8            # polite delay before each product (s)
     timeout: int = 40
     skip_filled: bool = False             # skip products that already have content
     overwrite: bool = True
+    max_workers: int = 4                  # concurrent products (1 = sequential)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,15 +274,23 @@ class ScrapeConfig:
 class ScraperEngine:
     def __init__(self, config: ScrapeConfig):
         self.cfg = config
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
-        self.dwatson = DwatsonClient(self.session, config.timeout)
-        self.healthwire = HealthwireClient(self.session, config.timeout)
         self.catalog = load_catalog(config.csv_path)
+        # Each worker thread gets its own Session + clients. requests.Session is
+        # not guaranteed thread-safe, and the read-only catalog is shared freely.
+        self._local = threading.local()
+
+    def _clients(self) -> tuple["DwatsonClient", "HealthwireClient"]:
+        if not getattr(self._local, "ready", False):
+            session = requests.Session()
+            session.headers.update({"User-Agent": USER_AGENT})
+            self._local.dwatson = DwatsonClient(session, self.cfg.timeout)
+            self._local.healthwire = HealthwireClient(session, self.cfg.timeout)
+            self._local.ready = True
+        return self._local.dwatson, self._local.healthwire
 
     # -- per-source resolution ------------------------------------------------ #
-    def _resolve_dwatson(self, item: CatalogItem) -> Optional[MatchResult]:
-        results = self.dwatson.search(item.name)
+    def _resolve_dwatson(self, item: CatalogItem, client: "DwatsonClient") -> Optional[MatchResult]:
+        results = client.search(item.name)
         if not results:
             return None
         best = None
@@ -290,7 +301,7 @@ class ScraperEngine:
                 best, best_score = (title, href), score
         if not best:
             return None
-        desc = self.dwatson.fetch_description(best[1])
+        desc = client.fetch_description(best[1])
         if not desc:
             return None
         return MatchResult(
@@ -299,8 +310,8 @@ class ScraperEngine:
             url=best[1], description=desc,
         )
 
-    def _resolve_healthwire(self, item: CatalogItem) -> Optional[MatchResult]:
-        hits = self.healthwire.search(item.name)
+    def _resolve_healthwire(self, item: CatalogItem, client: "HealthwireClient") -> Optional[MatchResult]:
+        hits = client.search(item.name)
         if not hits:
             return None
         # Authoritative: match by item_id == folder id.
@@ -320,13 +331,13 @@ class ScraperEngine:
         url = chosen.get("url") or ""
         if not url:
             return None
-        desc = self.healthwire.fetch_description(url)
+        desc = client.fetch_description(url)
         if not desc:
             return None
         return MatchResult(
             folder_id=item.item_id, csv_name=item.name, status=STATUS_FOUND,
             source=SOURCE_HEALTHWIRE, matched_name=chosen.get("name", ""), score=score,
-            url=self.healthwire.BASE + url if url.startswith("/") else url, description=desc,
+            url=client.BASE + url if url.startswith("/") else url, description=desc,
         )
 
     def process_product(self, folder_id: str) -> MatchResult:
@@ -334,17 +345,19 @@ class ScraperEngine:
         if not item or not item.name:
             return MatchResult(folder_id=folder_id, status=STATUS_NO_CSV,
                                note="No matching row in CSV")
+        dwatson, healthwire = self._clients()
         resolvers = {
-            SOURCE_DWATSON: self._resolve_dwatson,
-            SOURCE_HEALTHWIRE: self._resolve_healthwire,
+            SOURCE_DWATSON: (self._resolve_dwatson, dwatson),
+            SOURCE_HEALTHWIRE: (self._resolve_healthwire, healthwire),
         }
         last_error = ""
         for src in self.cfg.source_order:
-            fn = resolvers.get(src)
-            if not fn:
+            entry = resolvers.get(src)
+            if not entry:
                 continue
+            fn, client = entry
             try:
-                res = fn(item)
+                res = fn(item, client)
                 if res and res.description:
                     return res
             except Exception as exc:  # network / parse error -> try next source
@@ -361,6 +374,15 @@ class ScraperEngine:
         limit = limit if limit is not None else self.cfg.batch_size
         return folders[offset: offset + limit]
 
+    def _process_with_delay(self, fid: str, stop: Callable[[], bool]) -> Optional[MatchResult]:
+        if stop():
+            return None
+        # Polite, jittered pause before each product so concurrent workers don't
+        # fire in lockstep. Aggregate request rate ~= workers / request_delay.
+        if self.cfg.request_delay:
+            time.sleep(random.uniform(0, self.cfg.request_delay))
+        return self.process_product(fid)
+
     def run_batch(
         self,
         folder_ids: list[str],
@@ -368,15 +390,34 @@ class ScraperEngine:
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> list[MatchResult]:
         out: list[MatchResult] = []
-        for fid in folder_ids:
-            if should_stop and should_stop():
-                break
-            res = self.process_product(fid)
-            out.append(res)
-            if on_result:
-                on_result(res)
-            if self.cfg.request_delay:
-                time.sleep(self.cfg.request_delay)
+        stop = should_stop or (lambda: False)
+        workers = max(1, int(getattr(self.cfg, "max_workers", 1)))
+
+        # Sequential path preserves the original, gentlest behaviour.
+        if workers == 1:
+            for fid in folder_ids:
+                if stop():
+                    break
+                res = self.process_product(fid)
+                out.append(res)
+                if on_result:
+                    on_result(res)
+                if self.cfg.request_delay:
+                    time.sleep(self.cfg.request_delay)
+            return out
+
+        # Concurrent path: N products in flight at once. as_completed yields on
+        # the calling thread, so on_result/out are touched single-threaded here;
+        # only process_product runs in the pool (each worker has its own session).
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(self._process_with_delay, fid, stop) for fid in folder_ids]
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res is None:  # skipped because stop was requested
+                    continue
+                out.append(res)
+                if on_result:
+                    on_result(res)
         return out
 
 
@@ -455,12 +496,14 @@ if __name__ == "__main__":
     ap.add_argument("--order", default="dwatson,healthwire")
     ap.add_argument("--min-score", type=float, default=80.0)
     ap.add_argument("--delay", type=float, default=0.8)
+    ap.add_argument("--threads", type=int, default=4, help="concurrent products (1 = sequential)")
     args = ap.parse_args()
 
     cfg = ScrapeConfig(
         products_root=args.root, csv_path=args.csv,
         source_order=tuple(args.order.split(",")),
         min_score=args.min_score, request_delay=args.delay,
+        max_workers=args.threads,
     )
     engine = ScraperEngine(cfg)
     folders = engine.select_folders(args.offset, args.limit)

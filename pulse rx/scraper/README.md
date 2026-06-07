@@ -45,7 +45,12 @@ or just double-click **`run.bat`** (installs deps then launches).
 - **Batch size** — how many products per run (default **50**, fully editable — set it to anything).
 - **Start offset** — index into the product list to begin at. Auto-advances by the batch size after each run, so clicking *Run batch* repeatedly walks the whole catalog.
 - **Min match score** — strictness for dwatson fuzzy matching (default 80).
-- **Delay (s)** — polite pause between products (default 0.8). Lower = faster.
+- **Delay (s)** — polite pause before each product (default 0.8). Lower = faster.
+- **Threads** — how many products to scrape **concurrently** (default 4, max 16). The
+  scraper is network-bound, so this is the biggest speed lever. Higher = faster, but
+  you hit dwatson/healthwire harder: too many threads risks rate-limiting, timeouts,
+  or temporary IP blocks (which can look like "not found"). 4–8 is a safe range; set
+  it to **1** for the original gentle, sequential behaviour.
 - **Source priority** — `dwatson, healthwire` (default) / `healthwire, dwatson` / single-site.
 - **xlsx header** — kept in A1. The engine preserves the file's existing header if present.
 - **Skip products already filled** — ignore products whose A2 already has text.
