@@ -16,6 +16,7 @@ import json
 import queue
 import threading
 import webbrowser
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -192,6 +193,10 @@ class ScraperApp(tk.Tk):
         ttk.Button(f, text="Select all", command=lambda: self._set_all(True)).pack(side="left", padx=3)
         ttk.Button(f, text="Deselect all", command=lambda: self._set_all(False)).pack(side="left", padx=3)
         ttk.Button(f, text="Clear results", command=self._clear_results).pack(side="left", padx=3)
+
+        ttk.Separator(f, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(f, text="⬇  Download report (xlsx)",
+                   command=self._download_report).pack(side="left", padx=3)
 
     def _build_results_table(self):
         f = ttk.LabelFrame(self, text="Results  (click \u2611 to toggle, double-click a row to view full description)",
@@ -506,6 +511,49 @@ class ScraperApp(tk.Tk):
                 self._logline(f"Write failed {r.folder_id}: {exc}")
         self._logline(f"Committed {ok}/{len(chosen)} descriptions.")
         messagebox.showinfo("Done", f"Wrote {ok} of {len(chosen)} descriptions.")
+
+    def _download_report(self):
+        if not self.results:
+            messagebox.showinfo("No results", "Run a batch first, then download the report.")
+            return
+        default = f"pulse_rx_report_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save scrape report",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All", "*.*")],
+            initialfile=default,
+        )
+        if not path:
+            return
+        cfg = self._gather_config()
+        stats = sc.compute_stats(list(self.results.values()))
+        meta = {
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "app_version": __version__,
+            "products_root": cfg.products_root,
+            "source_order": ", ".join(cfg.source_order),
+            "threads": cfg.max_workers,
+        }
+        try:
+            sc.export_report(list(self.results.values()), path, meta)
+        except PermissionError:
+            messagebox.showerror("Export failed",
+                                 "Could not write the file — is it open in Excel? Close it and retry.")
+            return
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self._logline(f"Report saved ({stats['found']}/{stats['total']} found): {path}")
+        if messagebox.askyesno(
+            "Report saved",
+            f"Saved {stats['total']} products "
+            f"({stats['found']} found, {stats['not_found']} not found, "
+            f"{stats['success_rate']:.0f}% success) to:\n{path}\n\nOpen it now?",
+        ):
+            try:
+                os.startfile(path)  # noqa: S606 - Windows file open
+            except Exception:
+                webbrowser.open(path)
 
     def _clear_results(self):
         self.results.clear()

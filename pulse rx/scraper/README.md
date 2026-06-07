@@ -69,6 +69,16 @@ or just double-click **`run.bat`** (installs deps then launches).
 - *Write selected to xlsx* writes every checked, found row into its
   `product_details.xlsx` (A1 = header, A2 = description, wrapped).
 
+**Download report**
+- *Download report (xlsx)* exports a polished, self-contained workbook of the
+  current results:
+  - **Summary** sheet — run statistics (total / found / not found / errors,
+    success rate, and a breakdown of descriptions by source).
+  - **Results** sheet — every product colour-marked by status (green = found,
+    amber = not found, red = error, grey = no CSV row), with the **matched name**,
+    **score**, a clickable **source URL** (where the description came from), and the
+    full description. Header row is frozen with auto-filters for easy sorting.
+
 ---
 
 ## Command-line (optional, for automation)

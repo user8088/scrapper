@@ -34,6 +34,8 @@ import urllib3
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -478,6 +480,199 @@ def read_existing_description(products_root: str, folder_id: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Report export
+# --------------------------------------------------------------------------- #
+STATUS_LABELS = {
+    STATUS_FOUND: "Found",
+    STATUS_NOT_FOUND: "Not found",
+    STATUS_NO_CSV: "No CSV row",
+    STATUS_ERROR: "Error",
+    STATUS_LOW_CONFIDENCE: "Low confidence",
+}
+
+# (cell fill, font colour) per status -- Excel's familiar green/amber/red palette.
+_REPORT_STYLE = {
+    STATUS_FOUND: ("C6EFCE", "1B7A30"),
+    STATUS_NOT_FOUND: ("FFEB9C", "9C6500"),
+    STATUS_ERROR: ("FFC7CE", "9C0006"),
+    STATUS_NO_CSV: ("E2E2E2", "5A5A5A"),
+    STATUS_LOW_CONFIDENCE: ("FFEB9C", "9C6500"),
+}
+
+_HEADER_FILL = "305496"     # dark blue
+_TITLE_FILL = "1F3864"      # darker blue
+_THIN = Side(style="thin", color="D9D9D9")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+
+def compute_stats(results) -> dict:
+    """Aggregate counts/rates from a list of MatchResult."""
+    total = len(results)
+    by_status: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    for r in results:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+        if r.status == STATUS_FOUND and r.source:
+            by_source[r.source] = by_source.get(r.source, 0) + 1
+    found = by_status.get(STATUS_FOUND, 0)
+    return {
+        "total": total,
+        "found": found,
+        "not_found": by_status.get(STATUS_NOT_FOUND, 0),
+        "errors": by_status.get(STATUS_ERROR, 0),
+        "no_csv": by_status.get(STATUS_NO_CSV, 0),
+        "low_confidence": by_status.get(STATUS_LOW_CONFIDENCE, 0),
+        "by_source": by_source,
+        "success_rate": (found / total * 100.0) if total else 0.0,
+    }
+
+
+def export_report(results, path: str, meta: Optional[dict] = None) -> str:
+    """Write a polished two-sheet xlsx report (Summary + Results) and return path.
+
+    Results are colour-marked by status, source URLs are clickable hyperlinks,
+    and the Summary sheet carries the run statistics.
+    """
+    meta = meta or {}
+    rows = sorted(
+        results,
+        key=lambda r: (int(r.folder_id) if str(r.folder_id).isdigit() else 1 << 62,
+                       str(r.folder_id)),
+    )
+    stats = compute_stats(results)
+
+    wb = Workbook()
+    _build_summary_sheet(wb.active, stats, meta)
+    _build_results_sheet(wb.create_sheet("Results"), rows)
+    wb.save(path)
+    return path
+
+
+def _build_summary_sheet(ws, stats: dict, meta: dict) -> None:
+    ws.title = "Summary"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 46
+
+    title = ws.cell(1, 1, "Pulse Rx — Scrape Report")
+    title.font = Font(bold=True, size=16, color="FFFFFF")
+    title.fill = PatternFill("solid", fgColor=_TITLE_FILL)
+    title.alignment = Alignment(vertical="center", indent=1)
+    ws.merge_cells("A1:B1")
+    ws.cell(1, 2).fill = PatternFill("solid", fgColor=_TITLE_FILL)
+    ws.row_dimensions[1].height = 28
+
+    r = 3
+    info = [
+        ("Generated", meta.get("generated", "")),
+        ("App version", meta.get("app_version", "")),
+        ("Products folder", meta.get("products_root", "")),
+        ("Source priority", meta.get("source_order", "")),
+        ("Threads", meta.get("threads", "")),
+    ]
+    for label, value in info:
+        if value in ("", None):
+            continue
+        ws.cell(r, 1, label).font = Font(color="808080")
+        ws.cell(r, 2, str(value))
+        r += 1
+
+    r += 1
+    hdr = ws.cell(r, 1, "Statistics")
+    hdr.font = Font(bold=True, size=12, color="FFFFFF")
+    hdr.fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    ws.cell(r, 2).fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+    r += 1
+
+    metrics = [
+        ("Total products", stats["total"], None),
+        ("Found", stats["found"], STATUS_FOUND),
+        ("Not found", stats["not_found"], STATUS_NOT_FOUND),
+        ("Errors", stats["errors"], STATUS_ERROR),
+        ("No CSV row", stats["no_csv"], STATUS_NO_CSV),
+    ]
+    if stats["low_confidence"]:
+        metrics.append(("Low confidence", stats["low_confidence"], STATUS_LOW_CONFIDENCE))
+    metrics.append(("Success rate", f"{stats['success_rate']:.1f}%", None))
+
+    for label, value, status in metrics:
+        c_label = ws.cell(r, 1, label)
+        c_value = ws.cell(r, 2, value)
+        c_label.border = _BORDER
+        c_value.border = _BORDER
+        c_label.font = Font(bold=(label in ("Total products", "Success rate")))
+        if status and status in _REPORT_STYLE:
+            fill, font = _REPORT_STYLE[status]
+            for c in (c_label, c_value):
+                c.fill = PatternFill("solid", fgColor=fill)
+                c.font = Font(color=font, bold=c is c_value)
+        r += 1
+
+    if stats["by_source"]:
+        r += 1
+        sub = ws.cell(r, 1, "Descriptions by source")
+        sub.font = Font(bold=True, color="FFFFFF")
+        sub.fill = PatternFill("solid", fgColor=_HEADER_FILL)
+        ws.cell(r, 2).fill = PatternFill("solid", fgColor=_HEADER_FILL)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        r += 1
+        for src, n in sorted(stats["by_source"].items(), key=lambda kv: -kv[1]):
+            ws.cell(r, 1, src).border = _BORDER
+            ws.cell(r, 2, n).border = _BORDER
+            r += 1
+
+
+def _build_results_sheet(ws, rows) -> None:
+    ws.sheet_view.showGridLines = False
+    headers = ["Item Id", "CSV Name", "Status", "Source", "Matched Name",
+               "Score", "Source URL", "Description"]
+    widths = [10, 34, 13, 12, 34, 8, 52, 90]
+    for col, (text, width) in enumerate(zip(headers, widths), start=1):
+        c = ws.cell(1, col, text)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=_HEADER_FILL)
+        c.alignment = Alignment(vertical="center", horizontal="center")
+        c.border = _BORDER
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.row_dimensions[1].height = 22
+    ws.freeze_panes = "A2"
+
+    for i, res in enumerate(rows, start=2):
+        values = [
+            res.folder_id,
+            res.csv_name,
+            STATUS_LABELS.get(res.status, res.status),
+            res.source or "",
+            res.matched_name or "",
+            (round(res.score, 1) if res.score else ""),
+            res.url or "",
+            res.description or res.note or "",
+        ]
+        for col, val in enumerate(values, start=1):
+            c = ws.cell(i, col, val)
+            c.border = _BORDER
+            c.alignment = Alignment(
+                vertical="top",
+                wrap_text=(col in (2, 5, 8)),
+                horizontal=("center" if col in (3, 4, 6) else "left"),
+            )
+        # Status colour
+        fill, font = _REPORT_STYLE.get(res.status, ("FFFFFF", "000000"))
+        sc_cell = ws.cell(i, 3)
+        sc_cell.fill = PatternFill("solid", fgColor=fill)
+        sc_cell.font = Font(color=font, bold=True)
+        sc_cell.alignment = Alignment(vertical="top", horizontal="center")
+        # Clickable source link
+        if res.url:
+            link = ws.cell(i, 7)
+            link.hyperlink = res.url
+            link.font = Font(color="0563C1", underline="single")
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, len(rows) + 1)}"
+
+
+# --------------------------------------------------------------------------- #
 # CLI entry point
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -497,6 +692,7 @@ if __name__ == "__main__":
     ap.add_argument("--min-score", type=float, default=80.0)
     ap.add_argument("--delay", type=float, default=0.8)
     ap.add_argument("--threads", type=int, default=4, help="concurrent products (1 = sequential)")
+    ap.add_argument("--report", default="", help="write a styled xlsx report to this path")
     args = ap.parse_args()
 
     cfg = ScrapeConfig(
@@ -518,3 +714,13 @@ if __name__ == "__main__":
     results = engine.run_batch(folders, on_result=cb)
     found = sum(1 for r in results if r.status == STATUS_FOUND)
     print(f"\nDone: {found}/{len(results)} found.")
+
+    if args.report:
+        from datetime import datetime
+        export_report(results, args.report, meta={
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "products_root": cfg.products_root,
+            "source_order": ", ".join(cfg.source_order),
+            "threads": cfg.max_workers,
+        })
+        print(f"Report written: {args.report}")
