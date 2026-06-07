@@ -15,6 +15,12 @@ env/
 # Scraper local config
 pulse rx/scraper/config.json
 
+# PyInstaller build artifacts
+pulse rx/scraper/build/
+pulse rx/scraper/dist/
+pulse rx/scraper/*.spec
+PulseRxScraper.new.exe
+
 # OS / editor
 .DS_Store
 Thumbs.db

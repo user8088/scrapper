@@ -81,12 +81,51 @@ Flags: `--root`, `--csv`, `--offset`, `--limit`, `--order`, `--min-score`,
 
 ---
 
+## Distribution & auto-updates
+
+The app ships as a **single `PulseRxScraper.exe`** — users download one file and
+run it, no Python needed. On launch it quietly checks GitHub Releases and, if a
+newer version exists, offers to download and restart into it. So you publish
+once and every install updates itself.
+
+### For users
+Download the latest `PulseRxScraper.exe` from
+**https://github.com/user8088/scrapper/releases/latest** and run it. Place it
+wherever is convenient — on first run, use **Browse** to point *Products folder*
+and *Item List CSV* at your data (it remembers them in `config.json` next to the
+exe). When an update is published, click **Yes** on the prompt at startup (or
+**Help → Check for updates…**) and it self-updates.
+
+### For you — publishing an update
+1. Make your changes.
+2. Run the release helper with the new version number:
+   ```powershell
+   cd "pulse rx/scraper"
+   .\release.ps1 1.1.0
+   ```
+   This bumps `version.py`, commits, tags `v1.1.0`, and pushes. **GitHub Actions**
+   (`.github/workflows/release.yml`) builds the exe and publishes the release.
+3. Existing installs detect the newer tag on their next launch and update.
+
+> The version in `version.py` **must** match the tag — `release.ps1` keeps them
+> in sync, and CI fails the build if they ever diverge.
+
+### Building the exe locally (optional)
+```powershell
+cd "pulse rx/scraper"
+.\build.ps1          # -> dist\PulseRxScraper.exe
+```
+
 ## Files
 
 - `scraper_core.py` — UI-agnostic engine (site clients, matching, xlsx writer). Importable + CLI.
-- `app.py` — Tkinter desktop UI.
+- `app.py` — Tkinter desktop UI (+ auto-update on launch).
+- `updater.py` — checks GitHub Releases, downloads & swaps in the new exe.
+- `version.py` — the app's version (source of truth; bumped by `release.ps1`).
+- `build.ps1` — builds the standalone exe with PyInstaller.
+- `release.ps1` — bumps the version, tags, and pushes to trigger a release.
 - `requirements.txt` — dependencies.
-- `run.bat` — Windows launcher.
+- `run.bat` — Windows launcher (run from source).
 - `config.json` — saved settings (created on first *Save settings*).
 
 ## Notes / tuning

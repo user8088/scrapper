@@ -11,6 +11,7 @@ Run:  python app.py
 from __future__ import annotations
 
 import os
+import sys
 import json
 import queue
 import threading
@@ -19,8 +20,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import scraper_core as sc
+import updater
+from version import __version__
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+
+def _app_dir() -> str:
+    """Directory the app 'lives' in: the exe's folder when frozen, else this file's."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+HERE = _app_dir()
 CONFIG_FILE = os.path.join(HERE, "config.json")
 DEFAULT_ROOT = os.path.normpath(os.path.join(HERE, "..", "Products"))
 DEFAULT_CSV = os.path.normpath(os.path.join(HERE, "..", "Item List - 260327 (Items with ID).csv"))
@@ -39,7 +50,7 @@ STATUS_COLORS = {
 class ScraperApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Pulse Rx - Description Scraper")
+        self.title(f"Pulse Rx - Description Scraper  (v{__version__})")
         self.geometry("1180x760")
         self.minsize(960, 640)
 
@@ -51,11 +62,32 @@ class ScraperApp(tk.Tk):
         self.total_in_run = 0
         self.done_in_run = 0
 
+        self._build_menu()
         self._build_style()
         self._build_widgets()
         self._load_config()
         self.after(120, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Silent check on launch; only the packaged exe can self-apply.
+        self.after(1200, lambda: self._start_update_check(silent=True))
+
+    # -------------------------------------------------------------------- menu
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        helpm = tk.Menu(menubar, tearoff=0)
+        helpm.add_command(label="Check for updates…",
+                          command=lambda: self._start_update_check(silent=False))
+        helpm.add_separator()
+        helpm.add_command(label=f"About  (v{__version__})", command=self._about)
+        menubar.add_cascade(label="Help", menu=helpm)
+        self.config(menu=menubar)
+
+    def _about(self):
+        messagebox.showinfo(
+            "About",
+            f"Pulse Rx - Description Scraper\nVersion {__version__}\n\n"
+            f"Updates: {updater.RELEASES_PAGE}",
+        )
 
     # ------------------------------------------------------------------ style
     def _build_style(self):
@@ -339,6 +371,14 @@ class ScraperApp(tk.Tk):
                     self._logline("ERROR: " + str(payload))
                 elif kind == "done":
                     self._on_run_done()
+                elif kind == "update":
+                    self._on_update_check_result(*payload)
+                elif kind == "upd_progress":
+                    self._on_update_progress(*payload)
+                elif kind == "upd_ready":
+                    self._on_update_downloaded(payload)
+                elif kind == "upd_failed":
+                    self._on_update_failed(payload)
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
@@ -473,6 +513,98 @@ class ScraperApp(tk.Tk):
     def _on_close(self):
         self.stop_flag.set()
         self.destroy()
+
+    # ------------------------------------------------------------- auto-update
+    def _start_update_check(self, silent: bool):
+        """Check GitHub for a newer release in a background thread."""
+        def work():
+            info = updater.check_for_update()
+            self.event_queue.put(("update", (info, silent)))
+        threading.Thread(target=work, daemon=True).start()
+        if not silent:
+            self._logline("Checking for updates…")
+
+    def _on_update_check_result(self, info, silent: bool):
+        if info is None:
+            if not silent:
+                messagebox.showinfo("Up to date",
+                                    f"You're running the latest version (v{__version__}).")
+            return
+
+        # A newer release exists. Running from source can't self-replace.
+        if not updater.is_frozen():
+            if messagebox.askyesno(
+                "Update available",
+                f"Version {info.version} is available (you have {__version__}).\n\n"
+                "This is a source checkout, so it can't update itself.\n"
+                "Open the releases page to download?",
+            ):
+                webbrowser.open(updater.RELEASES_PAGE)
+            return
+
+        if not messagebox.askyesno(
+            "Update available",
+            f"Version {info.version} is available (you have {__version__}).\n\n"
+            f"{(info.notes[:500] + '…') if len(info.notes) > 500 else info.notes}\n\n"
+            "Download and install it now? The app will restart.",
+        ):
+            return
+        self._begin_download(info)
+
+    def _begin_download(self, info):
+        # Lightweight modal progress dialog.
+        self._upd_win = tk.Toplevel(self)
+        self._upd_win.title("Updating")
+        self._upd_win.geometry("360x110")
+        self._upd_win.resizable(False, False)
+        self._upd_win.transient(self)
+        self._upd_win.grab_set()
+        ttk.Label(self._upd_win, text=f"Downloading version {info.version}…",
+                  padding=10).pack(anchor="w")
+        self._upd_bar = ttk.Progressbar(self._upd_win, mode="determinate", maximum=100)
+        self._upd_bar.pack(fill="x", padx=10, pady=6)
+        self._upd_pct = ttk.Label(self._upd_win, text="0%", padding=(10, 0))
+        self._upd_pct.pack(anchor="w")
+
+        def work():
+            try:
+                def prog(read, total):
+                    self.event_queue.put(("upd_progress", (read, total)))
+                path = updater.download_update(info, on_progress=prog)
+                self.event_queue.put(("upd_ready", path))
+            except Exception as exc:  # network / disk errors
+                self.event_queue.put(("upd_failed", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_progress(self, read, total):
+        if not getattr(self, "_upd_bar", None):
+            return
+        if total > 0:
+            pct = int(read * 100 / total)
+            self._upd_bar.configure(value=pct)
+            self._upd_pct.configure(text=f"{pct}%  ({read // 1024} / {total // 1024} KB)")
+        else:
+            self._upd_bar.configure(mode="indeterminate")
+            self._upd_bar.start(20)
+
+    def _on_update_downloaded(self, path):
+        if getattr(self, "_upd_win", None):
+            self._upd_win.destroy()
+            self._upd_win = None
+        self._logline("Update downloaded. Restarting to apply…")
+        try:
+            updater.apply_update_and_restart(path)
+        except Exception as exc:
+            messagebox.showerror("Update failed", str(exc))
+            return
+        self.stop_flag.set()
+        self.destroy()
+
+    def _on_update_failed(self, err):
+        if getattr(self, "_upd_win", None):
+            self._upd_win.destroy()
+            self._upd_win = None
+        messagebox.showerror("Update failed", f"Could not download the update:\n{err}")
 
 
 if __name__ == "__main__":
