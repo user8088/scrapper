@@ -60,6 +60,12 @@ or just double-click **`run.bat`** (installs deps then launches).
 - **Preview then commit** — scrape a batch, review each row, then **Write selected to xlsx**.
 - **Write directly while scraping** — writes each found description immediately.
 
+**Search**
+- The **Search batch** box above the table filters the current results live as you
+  type — matching across name, Item Id, source, status, matched name, and the
+  description text. A counter shows how many of the total are visible; **Clear**
+  resets it. (Filtering only hides rows; it never changes what you scraped or commit.)
+
 **Results table**
 - Click the **☑ / ☐** in the first column to include/exclude a row.
 - **Double-click** any row to read the full description, open the source URL, or write just that one.

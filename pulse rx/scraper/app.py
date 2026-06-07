@@ -105,8 +105,25 @@ class ScraperApp(tk.Tk):
     def _build_widgets(self):
         self._build_config_panel()
         self._build_control_panel()
+        self._build_search_bar()
         self._build_results_table()
         self._build_status_bar()
+
+    def _build_search_bar(self):
+        f = ttk.Frame(self)
+        f.pack(fill="x", padx=10, pady=(2, 0))
+        ttk.Label(f, text="🔎  Search batch:").pack(side="left")
+        self.var_search = tk.StringVar()
+        ent = ttk.Entry(f, textvariable=self.var_search, width=44)
+        ent.pack(side="left", padx=6)
+        ttk.Button(f, text="Clear", width=6,
+                   command=lambda: self.var_search.set("")).pack(side="left")
+        self.var_searchcount = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.var_searchcount, foreground="#666").pack(side="left", padx=10)
+        ttk.Label(f, text="(name, Item Id, source, status, description)",
+                  foreground="#999").pack(side="left")
+        # Live filter as the user types.
+        self.var_search.trace_add("write", self._apply_filter)
 
     def _build_config_panel(self):
         f = ttk.LabelFrame(self, text="Configuration", padding=8)
@@ -407,6 +424,9 @@ class ScraperApp(tk.Tk):
             res.status, preview or (res.note or ""),
         ))
         self.var_status.set(f"{self.done_in_run}/{self.total_in_run} processed")
+        # Respect an active search filter for rows that stream in mid-run.
+        if self.var_search.get().strip():
+            self._apply_filter()
         flag = " [written]" if res.note == "written" else ""
         self._logline(f"[{res.status:11}] {res.folder_id} {res.source or '-':10} "
                       f"score={res.score:<5g} {res.matched_name[:40]}{flag}")
@@ -421,6 +441,26 @@ class ScraperApp(tk.Tk):
         self.var_offset.set(int(self.var_offset.get()) + self.total_in_run)
         self.var_status.set(f"Done. {self.done_in_run} processed, next offset {self.var_offset.get()}.")
         self._logline(f"Batch finished. {found} found. Next offset = {self.var_offset.get()}.")
+
+    # -------------------------------------------------------------- search/filter
+    @staticmethod
+    def _haystack(res: sc.MatchResult) -> str:
+        return " ".join(str(x) for x in (
+            res.folder_id, res.csv_name, res.matched_name,
+            res.source, res.status, res.description, res.note)).lower()
+
+    def _apply_filter(self, *_):
+        if not hasattr(self, "tree"):
+            return
+        q = self.var_search.get().strip().lower()
+        idx = 0
+        for fid, res in self.results.items():
+            if not q or q in self._haystack(res):
+                self.tree.reattach(fid, "", idx)
+                idx += 1
+            else:
+                self.tree.detach(fid)
+        self.var_searchcount.set(f"{idx} of {len(self.results)} shown" if q else "")
 
     # --------------------------------------------------------- tree interaction
     def _on_tree_click(self, event):
@@ -556,9 +596,13 @@ class ScraperApp(tk.Tk):
                 webbrowser.open(path)
 
     def _clear_results(self):
+        # Delete by known ids so filtered-out (detached) rows are removed too.
+        for fid in list(self.results.keys()):
+            if self.tree.exists(fid):
+                self.tree.delete(fid)
         self.results.clear()
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
+        self.var_search.set("")
+        self.var_searchcount.set("")
         self.progress.configure(value=0)
         self.btn_commit.configure(state="disabled")
         self.var_status.set("Cleared.")
