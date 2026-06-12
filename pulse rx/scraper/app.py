@@ -415,7 +415,8 @@ class ScraperApp(tk.Tk):
         self.progress.configure(value=self.done_in_run)
         self.results[res.folder_id] = res
         res.selected = res.status == sc.STATUS_FOUND
-        preview = (res.description[:140] + "...") if len(res.description) > 140 else res.description
+        preview = sc.html_text(res.description)
+        preview = (preview[:140] + "...") if len(preview) > 140 else preview
         preview = preview.replace("\n", " ")
         self.tree.insert("", "end", iid=res.folder_id, tags=(res.status,), values=(
             CHECK_ON if res.selected else CHECK_OFF,

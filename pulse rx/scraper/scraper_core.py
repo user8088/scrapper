@@ -5,12 +5,18 @@ Matches each product folder (named by Item Id) against two pharmacy sites and
 fetches a rich product description:
 
   * dwatson.pk   -> Magento store. Search at /catalogsearch/result/?q=...
-                    The full structured marketing description lives in the
-                    `og:description` meta tag (the preferred output format).
+                    The description is captured as HTML from the page body
+                    block (preserving <b> headings and <br> line structure);
+                    the plain-text `og:description` meta is only a fallback.
   * healthwire.pk-> Rails store. JSON search at /searches. Its `item_id`
                     matches the Pulse Rx Item Id exactly, giving an
-                    authoritative match. Description is built from the product
-                    page body sections (Description / Uses / Dosage / ...).
+                    authoritative match. Description is built as HTML from the
+                    product page body sections (Description / Uses / ...),
+                    preserving paragraphs and bullet lists exactly.
+
+Descriptions are written as sanitized HTML fragments restricted to the tag
+subset the Pulse Rx site renders verbatim (see `clean_html`), so the storefront
+shows an exact copy of the source site's structure.
 
 The module is UI-agnostic: `process_product` returns a structured result and
 `write_description` commits a description into the product's xlsx file.
@@ -29,9 +35,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
+from urllib.parse import urljoin
+
 import requests
 import urllib3
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from rapidfuzz import fuzz
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -87,6 +95,59 @@ def pack_tokens(name: str) -> set:
 
 def name_score(a: str, b: str) -> float:
     return fuzz.token_sort_ratio((a or "").lower(), (b or "").lower())
+
+
+# --------------------------------------------------------------------------- #
+# HTML helpers
+# --------------------------------------------------------------------------- #
+# Tag subset the Pulse Rx site renders verbatim (mirrors the DOMPurify
+# allowlist in lib/products/description-content.ts). Anything written within
+# this subset reaches the storefront unchanged.
+_HTML_KEEP_TAGS = {
+    "p", "br", "strong", "b", "em", "i", "u",
+    "ul", "ol", "li", "h1", "h2", "h3", "h4", "a",
+}
+# Non-content tags whose subtree should be removed entirely; every other
+# disallowed tag is unwrapped so its text/children survive.
+_HTML_DROP_TAGS = {
+    "script", "style", "noscript", "iframe", "img", "svg", "picture",
+    "source", "video", "audio", "form", "button", "input", "select",
+}
+
+
+def clean_html(node, base_url: str = "") -> str:
+    """Reduce an HTML fragment to the allowlisted tag subset, preserving the
+    source structure exactly (paragraphs, bullet lists, bold headings, line
+    breaks). All attributes are stripped except a[href], which is resolved
+    against base_url so relative links keep working off-site."""
+    soup = BeautifulSoup(str(node), "html.parser")
+    for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        comment.extract()
+    for tag in soup.find_all(list(_HTML_DROP_TAGS)):
+        tag.decompose()
+    for tag in soup.find_all(True):
+        if tag.name not in _HTML_KEEP_TAGS:
+            tag.unwrap()
+            continue
+        if tag.name == "a":
+            href = (tag.get("href") or "").strip()
+            if href and base_url and not href.startswith(("http://", "https://", "mailto:", "tel:")):
+                href = urljoin(base_url, href)
+            tag.attrs = {"href": href} if href else {}
+        else:
+            tag.attrs = {}
+    html = str(soup)
+    # Collapse whitespace runs: rendering ignores them and they bloat the cell.
+    return re.sub(r"\s+", " ", html).strip()
+
+
+def html_text(html: str) -> str:
+    """Plain-text view of an HTML fragment (previews, emptiness checks)."""
+    if not html:
+        return ""
+    if "<" not in html:
+        return html.strip()
+    return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
 
 
 def is_strong_match(query_name: str, candidate_name: str, min_score: float) -> tuple[bool, float, str]:
@@ -174,13 +235,17 @@ class DwatsonClient:
         r = self.s.get(url, timeout=self.timeout, verify=False)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
+        # The body block carries the real formatting (<b> headings, <br> line
+        # structure); og:description is Magento's plain-text flattening of the
+        # same content, so it is only a fallback.
+        node = soup.select_one(".product.attribute.description .value, .description .value, #description")
+        if node:
+            html = clean_html(node, base_url=url)
+            if html_text(html):
+                return html
         og = soup.find("meta", attrs={"property": "og:description"})
         if og and og.get("content"):
             return normalize_text(og["content"])
-        # Fallback: description block in the page body.
-        node = soup.select_one("#description, .product.attribute.description .value, .description .value")
-        if node:
-            return normalize_text(node.get_text("\n", strip=True))
         return ""
 
 
@@ -220,19 +285,20 @@ class HealthwireClient:
             title = h2.get_text(strip=True)
             if title not in self.SECTIONS:
                 continue
-            chunk = []
+            chunk: list[str] = []
             sib = h2.find_next_sibling()
             guard = 0
             while sib is not None and sib.name not in ("h2",) and guard < 12:
-                txt = sib.get_text("\n", strip=True)
-                if txt:
-                    chunk.append(txt)
+                html = clean_html(sib, base_url=self.BASE)
+                if html:
+                    chunk.append(html)
                 sib = sib.find_next_sibling()
                 guard += 1
-            body = normalize_text("\n".join(chunk))
-            if body and body.lower() not in ("n/a", "na", "-", "not available"):
-                parts.append(f"{title}\n\n{body}")
-        return normalize_text("\n\n".join(parts))
+            body = "".join(chunk)
+            text = html_text(body)
+            if text and text.lower() not in ("n/a", "na", "-", "not available"):
+                parts.append(f"<h2>{title}</h2>{body}")
+        return "".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -444,9 +510,16 @@ def _xlsx_has_content(products_root: str, folder_id: str) -> bool:
         return False
 
 
+XLSX_CELL_LIMIT = 32767  # Excel's hard cap on characters per cell
+
+
 def write_description(products_root: str, folder_id: str, description: str,
                       header: str = "Details") -> str:
     """Write the description into A2 (header in A1). Returns the file path."""
+    if len(description) > XLSX_CELL_LIMIT:
+        # Cut at a tag boundary; the site's sanitizer rebalances unclosed tags.
+        cut = description.rfind("</", 0, XLSX_CELL_LIMIT)
+        description = description[:cut] if cut > 0 else description[:XLSX_CELL_LIMIT]
     path = _xlsx_path(products_root, folder_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
